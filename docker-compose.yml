@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  tengebot:
+    build: .
+    container_name: tengebot
+    restart: unless-stopped
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+    volumes:
+      - ./.env:/app/.env:ro
+    networks:
+      - bot-network
+
+networks:
+  bot-network:
+    driver: bridge
