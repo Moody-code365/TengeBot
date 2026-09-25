@@ -1,58 +1,60 @@
-# TengeBot
+# Multi-Currency USD Converter Bot
 
-Telegram bot for converting KZT to USD automatically.
+Telegram-бот на aiogram 3 для конвертации сумм в KZT, MDL, PLN, UAH, MXN, NGN и ETB в USD.
 
-## Features
+## Что умеет
 
-- Automatically detects amounts in KZT (тенге) in messages
-- Converts them to USD using real-time exchange rates
-- Supports various formats: `500тг`, `1500 тенге`, `10000₸`
-- Uses fallback rate if API is unavailable
+- Распознаёт суммы вроде `500₸`, `500тг` (слитно тоже работает), `100 злотых`, `1 500 грн`, `200 pesos`.
+- Поддерживает русские, украинские и английские названия валют, символы и ISO-коды.
+- Сохраняет порядок нескольких конвертаций в одном сообщении.
+- `/rates` (или кнопка "📊 Показать все курсы" под `/start`) показывает курс `1 USD` к поддерживаемым валютам и источник.
+- Источники используются в порядке: официальный ЦБ → ExchangeRate-API → резервное значение.
+- Кэширует успешно полученные курсы на CACHE_TTL_SECONDS (по умолчанию раз в полдня), чтобы не дергать внешние API на каждое сообщение.
+- Если все внешние источники временно недоступны, использует последний успешный кэш.
 
-## Docker Deployment
+## Запуск
 
-### Prerequisites
+### Docker Compose
 
-1. Docker and Docker Compose installed
-2. Telegram bot token from [@BotFather](https://t.me/BotFather)
+1. Создайте `.env` из `.env.example`.
+2. Заполните секреты.
+3. Запустите:
 
-### Setup
+```bash
+docker compose up -d --build
+```
 
-1. Create `.env` file with your bot token:
-   ```
-   BOT_TOKEN=your_telegram_bot_token_here
-   ```
+Логи:
 
-2. Run with Docker Compose:
-   ```bash
-   docker-compose up -d
-   ```
+```bash
+docker compose logs -f tengebot
+```
 
-### Commands
+Остановка:
 
-- Start the bot: `docker-compose up -d`
-- Stop the bot: `docker-compose down`
-- View logs: `docker-compose logs -f tengebot`
+```bash
+docker compose down
+```
 
-## Local Development
+### Локально
 
-1. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+```bash
+python -m venv .venv
+# Linux/macOS
+source .venv/bin/activate
+# Windows PowerShell: .venv\\Scripts\\Activate.ps1
+pip install -r requirements.txt
+python main.py
+```
 
-2. Create `.env` file with `BOT_TOKEN`
+## Переменные окружения
 
-3. Run the bot:
-   ```bash
-   python main.py
-   ```
+- `BOT_TOKEN` — токен Telegram-бота.
+- `EXCHANGE_API_KEY` — ключ ExchangeRate-API; можно оставить пустым, тогда используется публичный endpoint без ключа.
+- `BANXICO_TOKEN` — токен Banxico; если пустой/невалидный, MXN берётся из следующего источника.
+- `CACHE_TTL_SECONDS` — TTL кэша, по умолчанию 43200 секунд (12 часов, т.е. раз в полдня).
+- `LOG_LEVEL` — уровень логирования, по умолчанию `INFO`.
 
-## Usage
+## Важно про курсы
 
-Send any message containing amounts in KZT to the bot, and it will automatically convert them to USD.
-
-Examples:
-- `500тг` → `💰 500 ₸ = 1.11 $`
-- `1500 тенге` → `💰 1 500 ₸ = 3.33 $`
-- `10000₸` → `💰 10 000 ₸ = 22.22 $`
+Результат не гарантирует биржевой курс в реальном времени. В ответе указывается источник: официальный ЦБ, ExchangeRate-API или резервное значение. Резервное значение предназначено только для graceful degradation.
