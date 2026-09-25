@@ -1,5 +1,6 @@
 import asyncio
 import re
+import time
 import aiohttp
 import logging
 import os
@@ -12,7 +13,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-FALLBACK_RATE = 450.0  # курс на случай если API недоступно
+EXCHANGE_API_KEY = os.getenv("EXCHANGE_API_KEY")  # ключ с exchangerate-api.com (v6)
+CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "86400"))  # раз в сутки — фри-тариф всё равно обновляет раз в день
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,76 +22,144 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# Фолбэк-курсы к USD, если API недоступен и кэш пустой.
+# Раз в пару месяцев стоит обновлять руками.
+FALLBACK_RATES = {
+    "KZT": 450.0,
+    "MDL": 17.7,
+    "PLN": 3.9,
+    "UAH": 41.5,
+    "NGN": 1530.0,
+    "MXN": 18.4,
+    "ETB": 123.0,
+}
 
-async def get_usd_rate() -> float:
-    """Берём актуальный курс KZT/USD с открытого API."""
+CURRENCIES = {
+    "KZT": {"flag": "🇰🇿", "label": "тенге", "names": ["тг", "тенге", "тнг", "₸"]},
+    "MDL": {"flag": "🇲🇩", "label": "молд. лей", "names": ["лей", "леи", "лея", "mdl"]},
+    "PLN": {"flag": "🇵🇱", "label": "злотый", "names": ["злотых", "злотый", "zł", "zl", "pln"]},
+    "UAH": {"flag": "🇺🇦", "label": "гривна", "names": ["гривен", "гривны", "гривна", "грн", "₴", "uah"]},
+    "NGN": {"flag": "🇳🇬", "label": "найра", "names": ["найра", "наира", "₦", "ngn"]},
+    "MXN": {"flag": "🇲🇽", "label": "мекс. песо", "names": ["песо", "mxn"]},
+    "ETB": {"flag": "🇪🇹", "label": "быр", "names": ["быр", "birr", "etb"]},
+}
+
+
+def build_patterns() -> dict:
+    """Число + один из вариантов написания валюты, самые длинные варианты проверяем первыми."""
+    patterns = {}
+    for code, info in CURRENCIES.items():
+        names_sorted = sorted(info["names"], key=len, reverse=True)
+        names_re = "|".join(re.escape(n) for n in names_sorted)
+        patterns[code] = re.compile(rf"(\d[\d\s,.']*)\s*(?:{names_re})", re.IGNORECASE | re.UNICODE)
+    return patterns
+
+
+PATTERNS = build_patterns()
+
+_rates_cache = {"rates": None, "ts": 0.0}
+
+
+async def get_rates() -> dict:
+    """Курсы всех валют разом (база USD), кэш на CACHE_TTL секунд — экономим лимит API."""
+    now = time.time()
+    if _rates_cache["rates"] and now - _rates_cache["ts"] < CACHE_TTL:
+        return _rates_cache["rates"]
+
+    if EXCHANGE_API_KEY:
+        url = f"https://v6.exchangerate-api.com/v6/{EXCHANGE_API_KEY}/latest/USD"
+    else:
+        url = "https://api.exchangerate-api.com/v4/latest/USD"  # бесплатный фолбэк без ключа
+
     try:
         async with aiohttp.ClientSession() as session:
-            url = "https://api.exchangerate-api.com/v4/latest/USD"
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    rate = data["rates"].get("KZT")
-                    if rate:
-                        return float(rate)
+                    rates = data.get("conversion_rates") or data.get("rates")
+                    if rates:
+                        _rates_cache["rates"] = rates
+                        _rates_cache["ts"] = now
+                        return rates
     except Exception as e:
-        logger.warning(f"Не удалось получить курс: {e}. Используем fallback {FALLBACK_RATE}")
-    return FALLBACK_RATE
+        logger.warning(f"Не удалось получить курсы: {e}")
 
+    if _rates_cache["rates"]:
+        logger.warning("Отдаю устаревший кэш курсов")
+        return _rates_cache["rates"]
 
-# Ловим: 500тг / 500 тг / 500тенге / 500 тенге / 500₸ / 500 ₸
-PATTERN = re.compile(
-    r"(\d[\d\s,.']*)\s*(тг|тенге|₸)",
-    re.IGNORECASE | re.UNICODE
-)
+    logger.warning("Использую фолбэк-курсы")
+    return FALLBACK_RATES
 
 
 def parse_amount(raw: str) -> float:
-    """Чистим строку от пробелов и запятых, возвращаем число."""
-    cleaned = re.sub(r"[\s,']", "", raw).replace(".", "")
-    return float(cleaned)
+    """Разбираем число, где пробел/апостроф — разделитель тысяч, а , или . — либо тысячи, либо десятичные."""
+    s = re.sub(r"[\s']", "", raw)
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        tail = s.split(",")[-1]
+        s = s.replace(",", ".") if len(tail) in (1, 2) else s.replace(",", "")
+    return float(s)
+
+
+def format_number(x: float) -> str:
+    s = f"{x:,.2f}"
+    if s.endswith(".00"):
+        s = s[:-3]
+    return s.replace(",", " ")
 
 
 def format_usd(amount: float) -> str:
     if amount < 0.01:
         return f"{amount:.4f} $"
-    elif amount < 1:
+    if amount < 1:
         return f"{amount:.2f} $"
-    return f"{amount:,.2f} $".replace(",", " ")
+    return f"{format_number(amount)} $"
 
 
-@dp.message(Command("start"))
+@dp.message(Command("start", "help"))
 async def cmd_start(message: Message):
-    await message.reply(
-        "👋 Пишите суммы в тенге — переведу в доллары автоматически.\n\n"
-        "Примеры: <b>500тг</b>, <b>1500 тенге</b>, <b>10000₸</b>",
-        parse_mode="HTML"
-    )
+    lines = ["👋 Пишите сумму в валюте — переведу в доллары.", "", "Понимаю:"]
+    for code, info in CURRENCIES.items():
+        example = info["names"][0]
+        lines.append(f"{info['flag']} <b>{code}</b> — например «500 {example}»")
+    await message.reply("\n".join(lines), parse_mode="HTML")
 
 
 @dp.message(F.text)
 async def handle_message(message: Message):
     text = message.text or ""
-    matches = PATTERN.findall(text)
+    found = []  # (code, raw_amount)
 
-    if not matches:
-        return  # нет суммы в тенге — молчим
+    for code, pattern in PATTERNS.items():
+        for raw in pattern.findall(text):
+            found.append((code, raw))
 
-    rate = await get_usd_rate()
+    if not found:
+        return
+
+    rates = await get_rates()
     lines = []
 
-    for raw_amount, _ in matches:
+    for code, raw in found:
+        rate = rates.get(code)
+        if not rate:
+            continue
         try:
-            kzt = parse_amount(raw_amount)
-            usd = kzt / rate
-            kzt_str = f"{kzt:,.0f}".replace(",", " ")
-            lines.append(f"💰 <b>{kzt_str} ₸</b> = <b>{format_usd(usd)}</b>")
+            amount = parse_amount(raw)
         except ValueError:
             continue
+        usd = amount / rate
+        info = CURRENCIES[code]
+        lines.append(f"{info['flag']} <b>{format_number(amount)} {info['label']}</b> = <b>{format_usd(usd)}</b>")
 
     if lines:
         result = "\n".join(lines)
-        result += f"\n\n<i>📈 Курс: 1 $ = {rate:.1f} ₸</i>"
+        result += f"\n\n<i>📈 Курс обновлён не позднее часа назад</i>"
         await message.reply(result, parse_mode="HTML")
 
 
